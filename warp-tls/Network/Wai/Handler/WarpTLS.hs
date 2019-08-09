@@ -4,6 +4,7 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE PatternGuards #-}
+{-# LANGUAGE NamedFieldPuns #-}
 
 -- | HTTP over TLS support for Warp via the TLS package.
 --
@@ -262,7 +263,7 @@ runTLS tset set app = withSocketsDo $
 -- | Running 'Application' with 'TLSSettings' and 'Settings' using
 --   specified 'Socket'.
 runTLSSocket :: TLSSettings -> Settings -> Socket -> Application -> IO ()
-runTLSSocket tlsset@TLSSettings{..} set sock app = do
+runTLSSocket tlsset@TLSSettings{keyFile,certFile,chainCertFiles,chainCertsMemory,certMemory,keyMemory,tlsSessionManagerConfig} set sock app = do
     credential <- case (certMemory, keyMemory) of
         (Nothing, Nothing) ->
             either error id <$>
@@ -278,11 +279,12 @@ runTLSSocket tlsset@TLSSettings{..} set sock app = do
     runTLSSocket' tlsset set credential mgr sock app
 
 runTLSSocket' :: TLSSettings -> Settings -> TLS.Credential -> TLS.SessionManager -> Socket -> Application -> IO ()
-runTLSSocket' tlsset@TLSSettings{..} set credential mgr sock app =
+runTLSSocket' tlsset@TLSSettings{tlsWantClientCert,tlsServerDHEParams,tlsServerHooks,tlsAllowedVersions,tlsCiphers} set credential mgr sock app =
     runSettingsConnectionMakerSecure set get app
   where
     get = getter tlsset sock params
-    params = def { -- TLS.ServerParams
+    params :: TLS.ServerParams
+    params = def {
         TLS.serverWantClientCert = tlsWantClientCert
       , TLS.serverCACertificates = []
       , TLS.serverDHEParams      = tlsServerDHEParams
@@ -294,15 +296,18 @@ runTLSSocket' tlsset@TLSSettings{..} set credential mgr sock app =
 #endif
       }
     -- Adding alpn to user's tlsServerHooks.
+    hooks :: TLS.ServerHooks
     hooks = tlsServerHooks {
         TLS.onALPNClientSuggest = TLS.onALPNClientSuggest tlsServerHooks <|>
           (if settingsHTTP2Enabled set then Just alpn else Nothing)
       }
+    shared :: TLS.Shared
     shared = def {
         TLS.sharedCredentials    = TLS.Credentials [credential]
       , TLS.sharedSessionManager = mgr
       }
-    supported = def { -- TLS.Supported
+    supported :: TLS.Supported
+    supported = def {
         TLS.supportedVersions       = tlsAllowedVersions
       , TLS.supportedCiphers        = tlsCiphers
       , TLS.supportedCompressions   = [TLS.nullCompression]
@@ -336,16 +341,15 @@ mkConn :: TLS.TLSParams params => TLSSettings -> Socket -> params -> IO (Connect
 mkConn tlsset s params = switch `onException` close s
   where
     switch = do
-        firstBS <- safeRecv s 4096
-        if not (S.null firstBS) && S.head firstBS == 0x16 then
-            httpOverTls tlsset s firstBS params
-          else
-            plainHTTP tlsset s firstBS
+      firstBS <- safeRecv s 4096
+      if not (S.null firstBS) && S.head firstBS == 0x16
+        then httpOverTls tlsset s firstBS params
+        else plainHTTP tlsset s firstBS
 
 ----------------------------------------------------------------
 
 httpOverTls :: TLS.TLSParams params => TLSSettings -> Socket -> S.ByteString -> params -> IO (Connection, Transport)
-httpOverTls TLSSettings{..} s bs0 params = do
+httpOverTls TLSSettings{tlsLogging} s bs0 params = do
     recvN <- makePlainReceiveN s bs0
     ctx <- TLS.contextNew (backend recvN) params
     TLS.contextHookSetLogging ctx tlsLogging
@@ -356,6 +360,7 @@ httpOverTls TLSSettings{..} s bs0 params = do
     tls <- getTLSinfo ctx
     return (conn ctx writeBuf ref, tls)
   where
+    backend :: (Int -> IO S.ByteString) -> TLS.Backend
     backend recvN = TLS.Backend {
         TLS.backendFlush = return ()
 #if MIN_VERSION_network(3,1,1)
@@ -366,8 +371,12 @@ httpOverTls TLSSettings{..} s bs0 params = do
       , TLS.backendSend  = sendAll' s
       , TLS.backendRecv  = recvN
       }
+
+    sendAll' :: Socket -> S.ByteString -> IO ()
     sendAll' sock bs = sendAll sock bs `E.catch` \(SomeException _) ->
         throwIO ConnectionClosedByPeer
+
+    conn :: TLS.Context -> Buffer -> I.IORef S.ByteString -> Connection
     conn ctx writeBuf ref = Connection {
         connSendMany         = TLS.sendData ctx . L.fromChunks
       , connSendAll          = sendall
