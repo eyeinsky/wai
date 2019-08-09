@@ -65,9 +65,11 @@ Library
       Build-Depends: network               >= 2.3
   Exposed-modules:   Network.Wai.Handler.Warp
                      Network.Wai.Handler.Warp.Internal
+                     Network.Wai.Handler.Warp.Counter
+                     Network.Wai.Handler.Warp.Run
+                     Network.Wai.Handler.Warp.Settings
   Other-modules:     Network.Wai.Handler.Warp.Buffer
                      Network.Wai.Handler.Warp.Conduit
-                     Network.Wai.Handler.Warp.Counter
                      Network.Wai.Handler.Warp.Date
                      Network.Wai.Handler.Warp.FdCache
                      Network.Wai.Handler.Warp.File
@@ -89,9 +91,7 @@ Library
                      Network.Wai.Handler.Warp.RequestHeader
                      Network.Wai.Handler.Warp.Response
                      Network.Wai.Handler.Warp.ResponseHeader
-                     Network.Wai.Handler.Warp.Run
                      Network.Wai.Handler.Warp.SendFile
-                     Network.Wai.Handler.Warp.Settings
                      Network.Wai.Handler.Warp.Types
                      Network.Wai.Handler.Warp.Windows
                      Network.Wai.Handler.Warp.WithApplication

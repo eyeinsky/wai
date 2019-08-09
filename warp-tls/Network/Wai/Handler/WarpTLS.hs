@@ -5,6 +5,7 @@
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE NamedFieldPuns #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 -- | HTTP over TLS support for Warp via the TLS package.
 --
@@ -37,6 +38,8 @@ module Network.Wai.Handler.WarpTLS (
     -- * Runner
     , runTLS
     , runTLSSocket
+    , TLSApplication
+    , TLSAppInfo
     -- * Exception
     , WarpTLSException (..)
     , DH.Params
@@ -46,7 +49,9 @@ module Network.Wai.Handler.WarpTLS (
 import Control.Applicative ((<|>))
 import Control.Exception (Exception, throwIO, bracket, finally, handle, fromException, try, IOException, onException, SomeException(..), handleJust)
 import qualified Control.Exception as E
-import Control.Monad (void, guard)
+import Foreign.C.Error (Errno(..), eCONNABORTED)
+import GHC.IO.Exception (IOException(..))
+import Control.Monad (void, guard, unless, when)
 import qualified Data.ByteString as S
 import qualified Data.ByteString.Lazy as L
 import Data.Default.Class (def)
@@ -62,10 +67,19 @@ import qualified Network.TLS as TLS
 import qualified Crypto.PubKey.DH as DH
 import qualified Network.TLS.Extra as TLSExtra
 import qualified Network.TLS.SessionManager as SM
-import Network.Wai (Application)
 import Network.Wai.Handler.Warp
 import Network.Wai.Handler.Warp.Internal
 import System.IO.Error (isEOFError)
+
+import qualified Network.Wai as Wai
+import Network.Wai.Handler.Warp.Counter
+import Network.Wai.Handler.Warp.Run
+import Network.Wai.Handler.Warp.Settings
+import qualified System.TimeManager as T
+
+type MaybeContext = Maybe TLS.Context
+type TLSAppInfo = Maybe (I.IORef (Maybe TLS.CertificateChain))
+type TLSApplication = TLSAppInfo -> Wai.Request -> (Wai.Response -> IO Wai.ResponseReceived) -> IO Wai.ResponseReceived
 
 ----------------------------------------------------------------
 
@@ -250,8 +264,8 @@ tlsSettingsChainMemory cert chainCerts key = defaultTlsSettings
 
 ----------------------------------------------------------------
 
--- | Running 'Application' with 'TLSSettings' and 'Settings'.
-runTLS :: TLSSettings -> Settings -> Application -> IO ()
+-- | Running 'TLSApplication' with 'TLSSettings' and 'Settings'.
+runTLS :: TLSSettings -> Settings -> TLSApplication -> IO ()
 runTLS tset set app = withSocketsDo $
     bracket
         (bindPortTCP (getPort set) (getHost set))
@@ -262,7 +276,7 @@ runTLS tset set app = withSocketsDo $
 
 -- | Running 'Application' with 'TLSSettings' and 'Settings' using
 --   specified 'Socket'.
-runTLSSocket :: TLSSettings -> Settings -> Socket -> Application -> IO ()
+runTLSSocket :: TLSSettings -> Settings -> Socket -> TLSApplication -> IO ()
 runTLSSocket tlsset@TLSSettings{keyFile,certFile,chainCertFiles,chainCertsMemory,certMemory,keyMemory,tlsSessionManagerConfig} set sock app = do
     credential <- case (certMemory, keyMemory) of
         (Nothing, Nothing) ->
@@ -278,9 +292,9 @@ runTLSSocket tlsset@TLSSettings{keyFile,certFile,chainCertFiles,chainCertsMemory
       Just config -> SM.newSessionManager config
     runTLSSocket' tlsset set credential mgr sock app
 
-runTLSSocket' :: TLSSettings -> Settings -> TLS.Credential -> TLS.SessionManager -> Socket -> Application -> IO ()
+runTLSSocket' :: TLSSettings -> Settings -> TLS.Credential -> TLS.SessionManager -> Socket -> TLSApplication -> IO ()
 runTLSSocket' tlsset@TLSSettings{tlsWantClientCert,tlsServerDHEParams,tlsServerHooks,tlsAllowedVersions,tlsCiphers} set credential mgr sock app =
-    runSettingsConnectionMakerSecure set get app
+    runSettingsConnectionMakerSecure' set get app
   where
     get = getter tlsset sock params
     params :: TLS.ServerParams
@@ -320,6 +334,78 @@ runTLSSocket' tlsset@TLSSettings{tlsWantClientCert,tlsServerDHEParams,tlsServerH
 #endif
       }
 
+-- <copy>
+
+runSettingsConnectionMakerSecure'
+  :: Settings
+  -> IO (IO (Connection, Transport, MaybeContext), SockAddr)
+  -> TLSApplication
+  -> IO ()
+runSettingsConnectionMakerSecure' set getConnMaker app = do
+  settingsBeforeMainLoop set
+  counter <- newCounter
+  withII set $ \ii -> let
+      acceptConnectionLoop = do
+        mx <- acceptNewConnection' set getConnMaker
+        maybe (return ()) forkLoop mx
+      forkLoop (acceptRequest, addr) = do
+        fork' set acceptRequest addr app counter ii
+        acceptConnectionLoop
+    in do
+    E.mask_ $ do
+      E.allowInterrupt
+      acceptConnectionLoop
+    gracefulShutdown set counter
+
+acceptNewConnection' :: forall a. Settings -> IO a -> IO (Maybe a)
+acceptNewConnection' set getConnMaker =
+  try getConnMaker >>= either handleException (return . Just)
+  where
+    handleException :: IOException -> IO (Maybe a)
+    handleException e = let
+        eConnAborted = getErrno eCONNABORTED
+        getErrno (Errno cInt) = cInt
+      in if ioe_errno e == Just eConnAborted
+        then acceptNewConnection set getConnMaker
+        else do
+          settingsOnException set Nothing $ E.toException e
+          return Nothing
+
+fork'
+  :: Settings
+  -> IO (Connection, Transport, MaybeContext)
+  -> SockAddr
+  -> TLSApplication
+  -> Counter
+  -> InternalInfo
+  -> IO ()
+fork' set mkConn addr app counter ii = settingsFork set $ \unmask ->
+    handle (settingsOnException set Nothing) .
+    withClosedRef $ \ref ->
+      bracket mkConn (cleanUp ref) (serve unmask ref)
+  where
+    withClosedRef inner = I.newIORef False >>= inner
+
+    closeConn ref conn = do
+        isClosed <- I.atomicModifyIORef' ref $ \x -> (True, x)
+        unless isClosed $ connClose conn
+
+    cleanUp ref (conn, _, _) = closeConn ref conn `finally` connFree conn
+    serve unmask ref (conn, transport, maybeContext) = bracket register cancel $ \th -> do
+        unmask .
+           bracket (onOpen addr) (onClose addr) $ \goingon ->
+           when goingon $ serveConnection conn ii th addr transport set $ app tlsAppInfo
+      where
+        tlsAppInfo = TLS.ctxClientCerts <$> maybeContext :: TLSAppInfo
+        register = T.registerKillThread (timeoutManager ii)
+                                        (closeConn ref conn)
+        cancel   = T.cancel
+
+    onOpen adr    = increase counter >> settingsOnOpen  set adr
+    onClose adr _ = decrease counter >> settingsOnClose set adr
+
+-- </copy>
+
 alpn :: [S.ByteString] -> IO S.ByteString
 alpn xs
   | "h2"    `elem` xs = return "h2"
@@ -327,7 +413,7 @@ alpn xs
 
 ----------------------------------------------------------------
 
-getter :: TLS.TLSParams params => TLSSettings -> Socket -> params -> IO (IO (Connection, Transport), SockAddr)
+getter :: TLS.TLSParams params => TLSSettings -> Socket -> params -> IO (IO (Connection, Transport, MaybeContext), SockAddr)
 getter tlsset@TLSSettings{..} sock params = do
 #if WINDOWS
     (s, sa) <- windowsThreadBlockHack $ accept sock
@@ -337,18 +423,22 @@ getter tlsset@TLSSettings{..} sock params = do
     setSocketCloseOnExec s
     return (mkConn tlsset s params, sa)
 
-mkConn :: TLS.TLSParams params => TLSSettings -> Socket -> params -> IO (Connection, Transport)
+mkConn :: TLS.TLSParams params => TLSSettings -> Socket -> params -> IO (Connection, Transport, MaybeContext)
 mkConn tlsset s params = switch `onException` close s
   where
     switch = do
       firstBS <- safeRecv s 4096
       if not (S.null firstBS) && S.head firstBS == 0x16
-        then httpOverTls tlsset s firstBS params
-        else plainHTTP tlsset s firstBS
+        then do
+        (a, b, ctx) <- httpOverTls tlsset s firstBS params
+        return (a, b, Just ctx)
+        else do
+        (a, b) <- plainHTTP tlsset s firstBS
+        return (a, b, Nothing)
 
 ----------------------------------------------------------------
 
-httpOverTls :: TLS.TLSParams params => TLSSettings -> Socket -> S.ByteString -> params -> IO (Connection, Transport)
+httpOverTls :: TLS.TLSParams params => TLSSettings -> Socket -> S.ByteString -> params -> IO (Connection, Transport, TLS.Context)
 httpOverTls TLSSettings{tlsLogging} s bs0 params = do
     recvN <- makePlainReceiveN s bs0
     ctx <- TLS.contextNew (backend recvN) params
@@ -358,7 +448,7 @@ httpOverTls TLSSettings{tlsLogging} s bs0 params = do
     -- Creating a cache for leftover input data.
     ref <- I.newIORef ""
     tls <- getTLSinfo ctx
-    return (conn ctx writeBuf ref, tls)
+    return (conn ctx writeBuf ref, tls, ctx)
   where
     backend :: (Int -> IO S.ByteString) -> TLS.Backend
     backend recvN = TLS.Backend {
