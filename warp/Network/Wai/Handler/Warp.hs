@@ -116,6 +116,7 @@ module Network.Wai.Handler.Warp (
   , promisedResponseHeaders
   , promisedWeight
   , defaultPushPromise
+  , AcceptRequest
   ) where
 
 import Control.Exception (SomeException, throwIO)

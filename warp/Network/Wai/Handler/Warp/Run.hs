@@ -57,6 +57,8 @@ import Network.Wai.Handler.Warp.Windows
 import Network.Socket (fdSocket)
 #endif
 
+type AcceptRequest = IO (Connection, Transport)
+
 -- | Creating 'Connection' for plain HTTP based on a given socket.
 socketConnection :: Socket -> IO Connection
 socketConnection s = do
@@ -175,7 +177,7 @@ runSettingsConnectionMaker x y =
 -- or HTTP over TLS.
 --
 -- Since 2.1.4
-runSettingsConnectionMakerSecure :: Settings -> IO (IO (Connection, Transport), SockAddr) -> Application -> IO ()
+runSettingsConnectionMakerSecure :: Settings -> IO (AcceptRequest, SockAddr) -> Application -> IO ()
 runSettingsConnectionMakerSecure set getConnMaker app = do
     settingsBeforeMainLoop set
     counter <- newCounter
@@ -214,7 +216,7 @@ withII set action =
 --
 -- Our approach is explained in the comments below.
 acceptConnection :: Settings
-                 -> IO (IO (Connection, Transport), SockAddr)
+                 -> IO (AcceptRequest, SockAddr)
                  -> Application
                  -> Counter
                  -> InternalInfo
@@ -272,7 +274,7 @@ acceptNewConnection set getConnMaker = do
 -- Fork a new worker thread for this connection maker, and ask for a
 -- function to unmask (i.e., allow async exceptions to be thrown).
 fork :: Settings
-     -> IO (Connection, Transport)
+     -> AcceptRequest
      -> SockAddr
      -> Application
      -> Counter
