@@ -179,16 +179,17 @@ runSettingsConnectionMakerSecure :: Settings -> IO (IO (Connection, Transport), 
 runSettingsConnectionMakerSecure set getConnMaker app = do
     settingsBeforeMainLoop set
     counter <- newCounter
-    withII $ acceptConnection set getConnMaker app counter
-  where
-    withII action =
-        withTimeoutManager $ \tm ->
-        D.withDateCache $ \dc ->
-        F.withFdCache fdCacheDurationInSeconds $ \fdc ->
-        I.withFileInfoCache fdFileInfoDurationInSeconds $ \fic -> do
-            let ii = InternalInfo tm dc fdc fic
-            action ii
+    withII set $ acceptConnection set getConnMaker app counter
 
+withII :: Settings -> (InternalInfo -> IO c) -> IO c
+withII set action =
+    withTimeoutManager $ \tm ->
+    D.withDateCache $ \dc ->
+    F.withFdCache fdCacheDurationInSeconds $ \fdc ->
+    I.withFileInfoCache fdFileInfoDurationInSeconds $ \fic -> do
+        let ii = InternalInfo tm dc fdc fic
+        action ii
+  where
     !fdCacheDurationInSeconds = settingsFdCacheDuration set * 1000000
     !fdFileInfoDurationInSeconds = settingsFileInfoCacheDuration set * 1000000
     !timeoutInSeconds = settingsTimeout set * 1000000
@@ -224,42 +225,49 @@ acceptConnection set getConnMaker app counter ii = do
     -- acceptNewConnection and the registering of connClose.
     --
     -- acceptLoop can be broken by closing the listing socket.
-    void $ mask_ acceptLoop
+    void $ mask_ $ acceptLoop set getConnMaker ii counter app
     -- In some cases, we want to stop Warp here without graceful shutdown.
     -- So, async exceptions are allowed here.
     -- That's why `finally` is not used.
     gracefulShutdown set counter
-  where
-    acceptLoop = do
-        -- Allow async exceptions before receiving the next connection maker.
-        allowInterrupt
 
-        -- acceptNewConnection will try to receive the next incoming
-        -- request. It returns a /connection maker/, not a connection,
-        -- since in some circumstances creating a working connection
-        -- from a raw socket may be an expensive operation, and this
-        -- expensive work should not be performed in the main event
-        -- loop. An example of something expensive would be TLS
-        -- negotiation.
-        mx <- acceptNewConnection
-        case mx of
-            Nothing             -> return ()
-            Just (mkConn, addr) -> do
-                fork set mkConn addr app counter ii
-                acceptLoop
+acceptLoop :: Settings
+           -> IO (AcceptRequest, SockAddr)
+           -> InternalInfo
+           -> Counter
+           -> Application
+           -> IO ()
+acceptLoop set getConnMaker ii counter app = do
+    -- Allow async exceptions before receiving the next connection maker.
+    allowInterrupt
 
-    acceptNewConnection = do
-        ex <- try getConnMaker
-        case ex of
-            Right x -> return $ Just x
-            Left e -> do
-                let eConnAborted = getErrno eCONNABORTED
-                    getErrno (Errno cInt) = cInt
-                if ioe_errno e == Just eConnAborted
-                    then acceptNewConnection
-                    else do
-                        settingsOnException set Nothing $ toException e
-                        return Nothing
+    -- acceptNewConnection will try to receive the next incoming
+    -- request. It returns a /connection maker/, not a connection,
+    -- since in some circumstances creating a working connection
+    -- from a raw socket may be an expensive operation, and this
+    -- expensive work should not be performed in the main event
+    -- loop. An example of something expensive would be TLS
+    -- negotiation.
+    mx <- acceptNewConnection set getConnMaker
+    case mx of
+        Nothing             -> return ()
+        Just (mkConn, addr) -> do
+            fork set mkConn addr app counter ii
+            acceptLoop set getConnMaker ii counter app
+
+acceptNewConnection :: Settings -> IO a -> IO (Maybe a)
+acceptNewConnection set getConnMaker = do
+    ex <- try getConnMaker
+    case ex of
+        Right x -> return $ Just x
+        Left e -> do
+            let eConnAborted = getErrno eCONNABORTED
+                getErrno (Errno cInt) = cInt
+            if ioe_errno e == Just eConnAborted
+                then acceptNewConnection set getConnMaker
+                else do
+                    settingsOnException set Nothing $ toException e
+                    return Nothing
 
 -- Fork a new worker thread for this connection maker, and ask for a
 -- function to unmask (i.e., allow async exceptions to be thrown).
